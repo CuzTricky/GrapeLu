@@ -2,7 +2,15 @@
     GrapeLu - Murder Mystery 2
     Features: Role ESP, Coin Collector, Auto Grab Gun, Speed / Jump / Noclip
     UI: dark tabbed, draggable, works on mobile executors
+    RightShift (PC) shows / hides the menu.
 ]]
+
+local env = (getgenv and getgenv()) or _G
+
+-- Re-executing replaces the old copy instead of stacking loops and GUIs
+if env.GrapeLuUnload then
+	pcall(env.GrapeLuUnload)
+end
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -12,6 +20,13 @@ local lp = Players.LocalPlayer
 
 -- ========== STATE ==========
 local running = true
+local conns = {}
+
+local function track(c)
+	conns[#conns + 1] = c
+	return c
+end
+
 local S = {
 	ESP = false,
 	ESPNames = true,
@@ -24,6 +39,9 @@ local S = {
 	JumpVal = 60,
 	Noclip = false,
 }
+
+-- Values to restore when a toggle is switched off
+local orig = { WalkSpeed = 16, JumpPower = 50 }
 
 local COLORS = {
 	Murderer = Color3.fromRGB(255, 60, 60),
@@ -62,12 +80,19 @@ local espObjs = {}
 local function clearESP(plr)
 	local o = espObjs[plr]
 	if o then
-		for _, v in pairs(o) do
-			if typeof(v) == "Instance" then
-				v:Destroy()
-			end
+		if o.hl then
+			o.hl:Destroy()
+		end
+		if o.bb then
+			o.bb:Destroy()
 		end
 		espObjs[plr] = nil
+	end
+end
+
+local function clearAllESP()
+	for plr in pairs(espObjs) do
+		clearESP(plr)
 	end
 end
 
@@ -80,7 +105,7 @@ local function updateESP()
 			if S.ESP and ch and hum and hum.Health > 0 and head then
 				local role = getRole(plr)
 				local o = espObjs[plr]
-				if not o or not o.hl.Parent or o.char ~= ch then
+				if not o or not o.hl.Parent or not o.bb.Parent or o.char ~= ch then
 					clearESP(plr)
 					local hl = Instance.new("Highlight")
 					hl.FillTransparency = 0.5
@@ -118,7 +143,7 @@ local function updateESP()
 	end
 end
 
-Players.PlayerRemoving:Connect(clearESP)
+track(Players.PlayerRemoving:Connect(clearESP))
 
 task.spawn(function()
 	while running do
@@ -128,30 +153,62 @@ task.spawn(function()
 end)
 
 -- ========== AUTO GRAB GUN ==========
+local lastDeepSearch = 0
+
+local function findGun()
+	local g = workspace:FindFirstChild("GunDrop")
+	if g then
+		return g
+	end
+	-- Slower full search, at most every 3 seconds
+	if os.clock() - lastDeepSearch > 3 then
+		lastDeepSearch = os.clock()
+		return workspace:FindFirstChild("GunDrop", true)
+	end
+end
+
 task.spawn(function()
 	while running do
+		local didGrab = false
 		if S.Gun then
 			pcall(function()
-				local gun = workspace:FindFirstChild("GunDrop", true)
 				local hrp = getHRP()
-				if gun and hrp and getRole(lp) == "Innocent" then
-					local back = hrp.CFrame
-					hrp.CFrame = gun.CFrame
-					if firetouchinterest then
-						firetouchinterest(hrp, gun, 0)
-						firetouchinterest(hrp, gun, 1)
+				local hum = getHum()
+				if hrp and hum and hum.Health > 0 and getRole(lp) == "Innocent" then
+					local gun = findGun()
+					if gun and gun.Parent and gun:IsA("BasePart") then
+						didGrab = true
+						local back = hrp.CFrame
+						hrp.CFrame = gun.CFrame
+						if firetouchinterest then
+							firetouchinterest(hrp, gun, 0)
+							firetouchinterest(hrp, gun, 1)
+						end
+						task.wait(0.3)
+						if hrp.Parent then
+							hrp.CFrame = back
+						end
 					end
-					task.wait(0.3)
-					hrp.CFrame = back
 				end
 			end)
 		end
-		task.wait(0.5)
+		-- Cooldown after an attempt so a failed grab doesn't spam teleports
+		task.wait(didGrab and 1.5 or 0.5)
 	end
 end)
 
 -- ========== COIN COLLECTOR ==========
-local visited = {}
+local visited = setmetatable({}, { __mode = "k" })
+local currentTween
+
+local function cancelTween()
+	if currentTween then
+		pcall(function()
+			currentTween:Cancel()
+		end)
+		currentTween = nil
+	end
+end
 
 local function nearestCoin(hrp)
 	local container = workspace:FindFirstChild("CoinContainer", true)
@@ -183,14 +240,27 @@ task.spawn(function()
 					local coin, dist = nearestCoin(hrp)
 					if coin then
 						visited[coin] = os.clock()
+						local dur = math.max(dist / S.CoinSpeed, 0.05)
 						local tw = TweenService:Create(
 							hrp,
-							TweenInfo.new(math.max(dist / S.CoinSpeed, 0.05), Enum.EasingStyle.Linear),
+							TweenInfo.new(dur, Enum.EasingStyle.Linear),
 							{ CFrame = CFrame.new(coin.Position) }
 						)
+						currentTween = tw
 						tw:Play()
-						tw.Completed:Wait()
-						if firetouchinterest then
+						-- Wait for the tween, but bail out if toggled off, dead, or stuck
+						local t0 = os.clock()
+						while
+							running
+							and S.Coins
+							and hrp.Parent
+							and tw.PlaybackState == Enum.PlaybackState.Playing
+							and os.clock() - t0 < dur + 1
+						do
+							task.wait()
+						end
+						cancelTween()
+						if S.Coins and hrp.Parent and coin.Parent and firetouchinterest then
 							firetouchinterest(hrp, coin, 0)
 							firetouchinterest(hrp, coin, 1)
 						end
@@ -198,6 +268,8 @@ task.spawn(function()
 					else
 						task.wait(0.5)
 					end
+				else
+					task.wait(0.5)
 				end
 			end)
 		end
@@ -206,7 +278,7 @@ task.spawn(function()
 end)
 
 -- ========== MOVEMENT ==========
-RunService.Heartbeat:Connect(function()
+track(RunService.Heartbeat:Connect(function()
 	if not running then
 		return
 	end
@@ -220,23 +292,43 @@ RunService.Heartbeat:Connect(function()
 			hum.JumpPower = S.JumpVal
 		end
 	end
-end)
+end))
 
-RunService.Stepped:Connect(function()
+-- Noclip remembers each part's original CanCollide so turning it off restores it
+local ncOrig = setmetatable({}, { __mode = "k" })
+local ncActive = false
+
+local function restoreCollisions()
+	for p, v in pairs(ncOrig) do
+		if p.Parent then
+			p.CanCollide = v
+		end
+		ncOrig[p] = nil
+	end
+end
+
+track(RunService.Stepped:Connect(function()
 	if not running then
 		return
 	end
 	if S.Noclip or S.Coins then
+		ncActive = true
 		local c = lp.Character
 		if c then
 			for _, p in ipairs(c:GetDescendants()) do
 				if p:IsA("BasePart") then
+					if ncOrig[p] == nil then
+						ncOrig[p] = p.CanCollide
+					end
 					p.CanCollide = false
 				end
 			end
 		end
+	elseif ncActive then
+		ncActive = false
+		restoreCollisions()
 	end
-end)
+end))
 
 -- ========== UI ==========
 local function new(class, props, parent)
@@ -260,6 +352,36 @@ do
 		gui.Parent = lp:WaitForChild("PlayerGui")
 	end
 end
+
+-- Full cleanup: stops loops, disconnects events, restores the player
+local function unload()
+	if not running then
+		return
+	end
+	running = false
+	cancelTween()
+	for _, c in ipairs(conns) do
+		pcall(function()
+			c:Disconnect()
+		end)
+	end
+	clearAllESP()
+	restoreCollisions()
+	local hum = getHum()
+	if hum then
+		if S.Speed then
+			hum.WalkSpeed = orig.WalkSpeed
+		end
+		if S.Jump then
+			hum.JumpPower = orig.JumpPower
+		end
+	end
+	gui:Destroy()
+	if env.GrapeLuUnload == unload then
+		env.GrapeLuUnload = nil
+	end
+end
+env.GrapeLuUnload = unload
 
 local BG = Color3.fromRGB(18, 18, 24)
 local PANEL = Color3.fromRGB(26, 26, 34)
@@ -313,7 +435,7 @@ do
 			end)
 		end
 	end)
-	UserInputService.InputChanged:Connect(function(input)
+	track(UserInputService.InputChanged:Connect(function(input)
 		if
 			dragging
 			and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch)
@@ -326,8 +448,15 @@ do
 				startPos.Y.Offset + d.Y
 			)
 		end
-	end)
+	end))
 end
+
+-- RightShift shows / hides the menu (PC)
+track(UserInputService.InputBegan:Connect(function(input, processed)
+	if not processed and input.KeyCode == Enum.KeyCode.RightShift then
+		main.Visible = not main.Visible
+	end
+end))
 
 -- Minimize button
 local mini = new("TextButton", {
@@ -359,18 +488,7 @@ local close = new("TextButton", {
 	TextColor3 = TEXT,
 }, title)
 new("UICorner", { CornerRadius = UDim.new(0, 6) }, close)
-close.MouseButton1Click:Connect(function()
-	running = false
-	for _, plr in ipairs(Players:GetPlayers()) do
-		clearESP(plr)
-	end
-	local hum = getHum()
-	if hum then
-		hum.WalkSpeed = 16
-		hum.JumpPower = 50
-	end
-	gui:Destroy()
-end)
+close.MouseButton1Click:Connect(unload)
 
 -- Tabs
 local tabBar = new("Frame", {
@@ -465,7 +583,7 @@ local function addToggle(page, text, key, onChange)
 		S[key] = not S[key]
 		refresh()
 		if onChange then
-			onChange(S[key])
+			pcall(onChange, S[key])
 		end
 	end)
 	refresh()
@@ -510,7 +628,7 @@ end
 
 local function addLabel(page, text)
 	new("TextLabel", {
-		Size = UDim2.new(1, 0, 0, 30),
+		Size = UDim2.new(1, 0, 0, 40),
 		BackgroundTransparency = 1,
 		Text = text,
 		Font = Enum.Font.Gotham,
@@ -518,6 +636,7 @@ local function addLabel(page, text)
 		TextColor3 = DIM,
 		TextWrapped = true,
 		TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Top,
 	}, page)
 end
 
@@ -525,9 +644,7 @@ end
 local espPage = addTab("ESP", 1)
 addToggle(espPage, "Role ESP", "ESP", function(on)
 	if not on then
-		for _, plr in ipairs(Players:GetPlayers()) do
-			clearESP(plr)
-		end
+		clearAllESP()
 	end
 end)
 addToggle(espPage, "Show names", "ESPNames")
@@ -535,7 +652,11 @@ addLabel(espPage, "Red = Murderer, Blue = Sheriff, Green = Innocent")
 
 -- Farm tab
 local farmPage = addTab("Farm", 2)
-addToggle(farmPage, "Coin collector", "Coins")
+addToggle(farmPage, "Coin collector", "Coins", function(on)
+	if not on then
+		cancelTween()
+	end
+end)
 addValue(farmPage, "Coin speed", "CoinSpeed", 10, 60)
 addToggle(farmPage, "Auto grab gun", "Gun")
 addLabel(farmPage, "Gun grab returns you to where you were. Only runs while you're Innocent.")
@@ -543,20 +664,26 @@ addLabel(farmPage, "Gun grab returns you to where you were. Only runs while you'
 -- Player tab
 local plrPage = addTab("Player", 3)
 addToggle(plrPage, "Speed", "Speed", function(on)
-	if not on then
-		local h = getHum()
-		if h then
-			h.WalkSpeed = 16
-		end
+	local h = getHum()
+	if not h then
+		return
+	end
+	if on then
+		orig.WalkSpeed = h.WalkSpeed
+	else
+		h.WalkSpeed = orig.WalkSpeed
 	end
 end)
 addValue(plrPage, "Walk speed", "SpeedVal", 16, 80)
 addToggle(plrPage, "Jump power", "Jump", function(on)
-	if not on then
-		local h = getHum()
-		if h then
-			h.JumpPower = 50
-		end
+	local h = getHum()
+	if not h then
+		return
+	end
+	if on then
+		orig.JumpPower = h.JumpPower
+	else
+		h.JumpPower = orig.JumpPower
 	end
 end)
 addValue(plrPage, "Jump value", "JumpVal", 50, 200)
