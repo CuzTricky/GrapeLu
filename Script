@@ -48,6 +48,8 @@ local S = {
 	AimWall = true, -- skip targets behind walls
 	Predict = 0, -- lead time in hundredths of a second (0 = off)
 	ShowFOV = true,
+	SilentFOV = 500, -- silent aim looks much wider than aim assist
+	LogShots = false, -- debug: print remote calls to the console
 }
 
 -- Values to restore when a toggle is switched off
@@ -89,7 +91,7 @@ end
 -- The first gun holder of a round is the original sheriff. Anyone else who
 -- later holds the gun picked it up (a "Hero").
 local origSheriff, lastMurderer
-local lastKnifeSeen = os.clock()
+local lastKnifeSeen = -1000
 
 local function trackSheriff()
 	local now = os.clock()
@@ -119,6 +121,49 @@ local function trackSheriff()
 	end
 end
 
+-- ========== ROUND DETECTION ==========
+-- A round is on while a murderer exists. inMatch() also checks that YOU are
+-- alive and inside the map, so lobby / spectating / dead never counts.
+local function roundOn()
+	return os.clock() - lastKnifeSeen < 3
+end
+
+local coinContainer, lastContainerSearch = nil, 0
+local function getCoinContainer()
+	if coinContainer and coinContainer.Parent then
+		return coinContainer
+	end
+	coinContainer = nil
+	if os.clock() - lastContainerSearch > 1 then
+		lastContainerSearch = os.clock()
+		coinContainer = workspace:FindFirstChild("CoinContainer", true)
+	end
+	return coinContainer
+end
+
+local function inMatch()
+	local hrp, hum = getHRP(), getHum()
+	if not hrp or not hum or hum.Health <= 0 then
+		return false
+	end
+	if not roundOn() then
+		return false
+	end
+	local container = getCoinContainer()
+	local map = container and container.Parent
+	if map and map:IsA("Model") then
+		local ok, cf, size = pcall(map.GetBoundingBox, map)
+		if ok then
+			local rel = cf:PointToObjectSpace(hrp.Position)
+			local half = size / 2 + Vector3.new(80, 400, 80)
+			if math.abs(rel.X) > half.X or math.abs(rel.Y) > half.Y or math.abs(rel.Z) > half.Z then
+				return false
+			end
+		end
+	end
+	return true
+end
+
 -- ========== ESP ==========
 local espObjs = {}
 
@@ -141,8 +186,8 @@ local function clearAllESP()
 	end
 end
 
-local function updateESP()
-	for _, plr in ipairs(Players:GetPlayers()) do
+local function updateOneESP(plr)
+	do
 		if plr ~= lp then
 			local ch = plr.Character
 			local hum = ch and ch:FindFirstChildOfClass("Humanoid")
@@ -191,6 +236,12 @@ local function updateESP()
 	end
 end
 
+local function updateESP()
+	for _, plr in ipairs(Players:GetPlayers()) do
+		pcall(updateOneESP, plr)
+	end
+end
+
 track(Players.PlayerRemoving:Connect(clearESP))
 
 task.spawn(function()
@@ -220,7 +271,7 @@ end
 task.spawn(function()
 	while running do
 		local didGrab = false
-		if S.Gun then
+		if S.Gun and inMatch() then
 			pcall(function()
 				local hrp = getHRP()
 				local hum = getHum()
@@ -253,6 +304,7 @@ end)
 
 -- ========== COIN COLLECTOR ==========
 local visited = setmetatable({}, { __mode = "k" })
+local coinActive = false
 local currentTween
 
 local function cancelTween()
@@ -265,7 +317,7 @@ local function cancelTween()
 end
 
 local function nearestCoin(hrp)
-	local container = workspace:FindFirstChild("CoinContainer", true)
+	local container = getCoinContainer()
 	if not container then
 		return nil
 	end
@@ -273,7 +325,7 @@ local function nearestCoin(hrp)
 	for _, c in ipairs(container:GetDescendants()) do
 		if c:IsA("BasePart") and c.Name == "Coin_Server" then
 			local t = visited[c]
-			if not t or os.clock() - t > 6 then
+			if not t or os.clock() - t > 15 then
 				local d = (c.Position - hrp.Position).Magnitude
 				if not bestDist or d < bestDist then
 					best, bestDist = c, d
@@ -286,8 +338,17 @@ end
 
 task.spawn(function()
 	while running do
+		if not S.Coins then
+			coinActive = false
+		end
 		if S.Coins and not gunBusy then
 			pcall(function()
+				if not inMatch() then
+					coinActive = false
+					task.wait(0.5)
+					return
+				end
+				coinActive = true
 				local hrp = getHRP()
 				local hum = getHum()
 				if hrp and hum and hum.Health > 0 then
@@ -308,6 +369,8 @@ task.spawn(function()
 							running
 							and S.Coins
 							and not gunBusy
+							and roundOn()
+							and coin.Parent
 							and hrp.Parent
 							and tw.PlaybackState == Enum.PlaybackState.Playing
 							and os.clock() - t0 < dur + 1
@@ -366,7 +429,7 @@ track(RunService.Stepped:Connect(function()
 	if not running then
 		return
 	end
-	if S.Noclip or S.Coins then
+	if S.Noclip or coinActive then
 		ncActive = true
 		local c = lp.Character
 		if c then
@@ -383,6 +446,15 @@ track(RunService.Stepped:Connect(function()
 		ncActive = false
 		restoreCollisions()
 	end
+end))
+
+-- Reset per-life state so nothing carries over after a respawn / new round
+track(lp.CharacterAdded:Connect(function()
+	cancelTween()
+	gunBusy = false
+	coinActive = false
+	table.clear(ncOrig)
+	table.clear(visited)
 end))
 
 -- ========== UI ==========
@@ -813,13 +885,31 @@ local rayParams = RaycastParams.new()
 rayParams.FilterType = Enum.RaycastFilterType.Exclude
 
 local function isVisible(cam, part, targetChar)
-	local filter = { targetChar }
+	local excl = { targetChar }
 	if lp.Character then
-		filter[2] = lp.Character
+		excl[#excl + 1] = lp.Character
 	end
-	rayParams.FilterDescendantsInstances = filter
+	rayParams.FilterDescendantsInstances = excl
 	local origin = cam.CFrame.Position
-	return workspace:Raycast(origin, part.Position - origin, rayParams) == nil
+	for _ = 1, 6 do
+		local hit = workspace:Raycast(origin, part.Position - origin, rayParams)
+		if not hit then
+			return true
+		end
+		local inst = hit.Instance
+		if inst.CanCollide and inst.Transparency < 0.8 then
+			-- another player's body in the way doesn't count as a wall
+			local model = inst:FindFirstAncestorOfClass("Model")
+			if not (model and Players:GetPlayerFromCharacter(model)) then
+				return false
+			end
+		end
+		-- see-through / non-solid / a player: ignore it and keep tracing
+		excl[#excl + 1] = inst
+		rayParams.FilterDescendantsInstances = excl
+		origin = hit.Position
+	end
+	return true
 end
 
 local function aimCenter(cam)
@@ -829,33 +919,39 @@ local function aimCenter(cam)
 	return cam.ViewportSize / 2
 end
 
-local function getAimTarget(cam)
+local function getAimTarget(cam, fov, allowOffscreen)
 	local myRole = getRole(lp)
 	if myRole ~= "Sheriff" and myRole ~= "Murderer" then
 		return nil
 	end
 	local center = aimCenter(cam)
-	local bestPos, bestPart, bestDist = nil, nil, S.AimFOV
+	local bestPos, bestPart, bestDist = nil, nil, fov
+	local farPos, farPart, farDist
 	for _, plr in ipairs(Players:GetPlayers()) do
 		local ch = plr ~= lp and plr.Character
 		local hum = ch and ch:FindFirstChildOfClass("Humanoid")
 		local part = ch and ch:FindFirstChild(S.AimHead and "Head" or "HumanoidRootPart")
-		if hum and part and hum.Health > 0 then
-			local role = getRole(plr)
-			if myRole == "Murderer" or role == "Murderer" then
-				local sp, onScreen = cam:WorldToViewportPoint(part.Position)
-				if onScreen then
-					local d = (Vector2.new(sp.X, sp.Y) - center).Magnitude
-					if d < bestDist and (not S.AimWall or isVisible(cam, part, ch)) then
-						bestDist = d
-						bestPart = part
-						bestPos = part.Position + part.AssemblyLinearVelocity * (S.Predict / 100)
-					end
+		if hum and part and hum.Health > 0 and (myRole == "Murderer" or getRole(plr) == "Murderer") then
+			local pos = part.Position + part.AssemblyLinearVelocity * (S.Predict / 100)
+			local sp, onScreen = cam:WorldToViewportPoint(part.Position)
+			if onScreen then
+				local d = (Vector2.new(sp.X, sp.Y) - center).Magnitude
+				if d < bestDist and (not S.AimWall or isVisible(cam, part, ch)) then
+					bestDist, bestPos, bestPart = d, pos, part
+				end
+			elseif allowOffscreen then
+				-- silent aim can still hit someone you aren't looking at
+				local wd = (part.Position - cam.CFrame.Position).Magnitude
+				if (not farDist or wd < farDist) and (not S.AimWall or isVisible(cam, part, ch)) then
+					farDist, farPos, farPart = wd, pos, part
 				end
 			end
 		end
 	end
-	return bestPos, bestPart
+	if bestPos then
+		return bestPos, bestPart
+	end
+	return farPos, farPart
 end
 
 -- FOV circle
@@ -883,18 +979,16 @@ RunService:BindToRenderStep("GrapeLuAim", Enum.RenderPriority.Camera.Value + 1, 
 
 	local aimOn = S.Aim or S.Silent
 	local c = aimCenter(cam)
+	local radius = S.Aim and S.AimFOV or S.SilentFOV
 	fovCircle.Visible = S.ShowFOV and aimOn
-	fovCircle.Size = UDim2.fromOffset(S.AimFOV * 2, S.AimFOV * 2)
+	fovCircle.Size = UDim2.fromOffset(radius * 2, radius * 2)
 	fovCircle.Position = UDim2.fromOffset(c.X, c.Y)
 
 	silentPos, silentPart = nil, nil
 	if aimOn and holdingWeapon() then
-		local pos, part = getAimTarget(cam)
-		if pos then
-			if S.Silent then
-				silentPos, silentPart = pos, part
-			end
-			if S.Aim then
+		if S.Aim then
+			local pos = getAimTarget(cam, S.AimFOV, false)
+			if pos then
 				local holding = not S.AimHold
 					or not UserInputService.MouseEnabled
 					or UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
@@ -904,31 +998,85 @@ RunService:BindToRenderStep("GrapeLuAim", Enum.RenderPriority.Camera.Value + 1, 
 				end
 			end
 		end
+		if S.Silent then
+			silentPos, silentPart = getAimTarget(cam, S.SilentFOV, true)
+		end
 	end
 end)
 
--- Silent aim: makes the game read the target as your mouse position when it asks.
--- Needs an executor with hookmetamethod; if missing, the toggle simply does nothing.
+-- Silent aim has two parts so it works however the game reads your aim:
+--  1) Mouse.Hit / Mouse.Target are redirected to the target
+--  2) gun / knife remotes get their aim arguments rewritten to the target
+-- Needs an executor with hookmetamethod; if missing, the toggle snaps back to OFF.
 local hasHook = false
+local remoteLogT = {}
 do
 	local ok = pcall(function()
-		if hookmetamethod and newcclosure and checkcaller then
-			local oldIndex
-			oldIndex = hookmetamethod(
+		if not (hookmetamethod and newcclosure and checkcaller) then
+			return
+		end
+		local oldIndex
+		oldIndex = hookmetamethod(
+			game,
+			"__index",
+			newcclosure(function(self, key)
+				if running and S.Silent and silentPos and self == mouse and not checkcaller() then
+					if key == "Hit" then
+						return CFrame.new(silentPos)
+					elseif key == "Target" then
+						return silentPart
+					end
+				end
+				return oldIndex(self, key)
+			end)
+		)
+		hasHook = true
+
+		if getnamecallmethod then
+			local oldNamecall
+			oldNamecall = hookmetamethod(
 				game,
-				"__index",
-				newcclosure(function(self, key)
-					if running and S.Silent and silentPos and not checkcaller() and self == mouse then
-						if key == "Hit" then
-							return CFrame.new(silentPos)
-						elseif key == "Target" then
-							return silentPart
+				"__namecall",
+				newcclosure(function(self, ...)
+					local method = getnamecallmethod()
+					if running and (method == "FireServer" or method == "InvokeServer") and not checkcaller() then
+						local cls = self.ClassName
+						if cls == "RemoteEvent" or cls == "RemoteFunction" then
+							local name = self.Name
+							local lname = string.lower(name)
+							if S.LogShots then
+								local t = os.clock()
+								if not remoteLogT[name] or t - remoteLogT[name] > 0.5 then
+									remoteLogT[name] = t
+									print("[GrapeLu] remote:", name, method, ...)
+								end
+							end
+							local isShot = string.find(lname, "shoot", 1, true)
+								or string.find(lname, "throw", 1, true)
+								or string.find(lname, "knife", 1, true)
+								or string.find(lname, "gun", 1, true)
+							if S.Silent and silentPos and isShot then
+								local args = table.pack(...)
+								local hrp = getHRP()
+								for i = 1, args.n do
+									local a = args[i]
+									if typeof(a) == "Vector3" then
+										args[i] = silentPos
+									elseif typeof(a) == "CFrame" and hrp and (a.Position - hrp.Position).Magnitude > 6 then
+										-- aimed point, not the throw origin
+										args[i] = CFrame.new(silentPos)
+									end
+								end
+								if setnamecallmethod then
+									setnamecallmethod(method)
+								end
+								return oldNamecall(self, table.unpack(args, 1, args.n))
+							end
 						end
 					end
-					return oldIndex(self, key)
+					return oldNamecall(self, ...)
 				end)
 			)
-			hasHook = true
 		end
 	end)
 	hasHook = ok and hasHook
@@ -953,7 +1101,7 @@ addToggle(farmPage, "Coin collector", "Coins", function(on)
 end)
 addValue(farmPage, "Coin speed", "CoinSpeed", 10, 60)
 addToggle(farmPage, "Auto grab gun", "Gun")
-addLabel(farmPage, "Gun grab returns you to where you were. Only runs while you're Innocent.")
+addLabel(farmPage, "Both only run while you're alive in a round. Gun grab returns you to where you were and only runs while you're Innocent.", 52)
 
 -- Player tab
 local plrPage = addTab("Player", 3)
@@ -1000,12 +1148,14 @@ addToggle(aimPage, "Silent aim", "Silent", function(on)
 		return false
 	end
 end)
-addValue(aimPage, "FOV radius", "AimFOV", 30, 500)
+addValue(aimPage, "Aim FOV radius", "AimFOV", 30, 500)
+addValue(aimPage, "Silent FOV radius", "SilentFOV", 30, 2000)
 addToggle(aimPage, "Show FOV circle", "ShowFOV")
 addToggle(aimPage, "Target head", "AimHead")
 addToggle(aimPage, "Wall check", "AimWall")
 addValue(aimPage, "Prediction", "Predict", 0, 30)
-addLabel(aimPage, "Sheriff aims at the Murderer, Murderer aims at everyone. Only active while holding your Gun/Knife. Hold RMB is ignored on mobile.", 60)
+addToggle(aimPage, "Log remotes (debug)", "LogShots")
+addLabel(aimPage, "Sheriff aims at the Murderer, Murderer aims at everyone. Only active while holding your Gun/Knife. Hold RMB is ignored on mobile. Silent aim ignores where you look. If it misses, turn on Log remotes, shoot once, and check the console.", 76)
 
 selectTab("ESP")
 setMenuVisible(true)
