@@ -1,0 +1,565 @@
+--[[
+    GrapeLu - Murder Mystery 2
+    Features: Role ESP, Coin Collector, Auto Grab Gun, Speed / Jump / Noclip
+    UI: dark tabbed, draggable, works on mobile executors
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local lp = Players.LocalPlayer
+
+-- ========== STATE ==========
+local running = true
+local S = {
+	ESP = false,
+	ESPNames = true,
+	Coins = false,
+	CoinSpeed = 28,
+	Gun = false,
+	Speed = false,
+	SpeedVal = 24,
+	Jump = false,
+	JumpVal = 60,
+	Noclip = false,
+}
+
+local COLORS = {
+	Murderer = Color3.fromRGB(255, 60, 60),
+	Sheriff = Color3.fromRGB(70, 140, 255),
+	Innocent = Color3.fromRGB(70, 220, 120),
+}
+
+-- ========== HELPERS ==========
+local function getHRP()
+	local c = lp.Character
+	return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+local function getHum()
+	local c = lp.Character
+	return c and c:FindFirstChildOfClass("Humanoid")
+end
+
+local function getRole(plr)
+	local bp, ch = plr:FindFirstChild("Backpack"), plr.Character
+	local function has(c, n)
+		return c and c:FindFirstChild(n)
+	end
+	if has(bp, "Knife") or has(ch, "Knife") then
+		return "Murderer"
+	end
+	if has(bp, "Gun") or has(ch, "Gun") then
+		return "Sheriff"
+	end
+	return "Innocent"
+end
+
+-- ========== ESP ==========
+local espObjs = {}
+
+local function clearESP(plr)
+	local o = espObjs[plr]
+	if o then
+		for _, v in pairs(o) do
+			if typeof(v) == "Instance" then
+				v:Destroy()
+			end
+		end
+		espObjs[plr] = nil
+	end
+end
+
+local function updateESP()
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= lp then
+			local ch = plr.Character
+			local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+			local head = ch and ch:FindFirstChild("Head")
+			if S.ESP and ch and hum and hum.Health > 0 and head then
+				local role = getRole(plr)
+				local o = espObjs[plr]
+				if not o or not o.hl.Parent or o.char ~= ch then
+					clearESP(plr)
+					local hl = Instance.new("Highlight")
+					hl.FillTransparency = 0.5
+					hl.OutlineTransparency = 0
+					hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+					hl.Adornee = ch
+					hl.Parent = ch
+
+					local bb = Instance.new("BillboardGui")
+					bb.Size = UDim2.fromOffset(120, 30)
+					bb.StudsOffset = Vector3.new(0, 2.5, 0)
+					bb.AlwaysOnTop = true
+					bb.Adornee = head
+					bb.Parent = head
+					local tl = Instance.new("TextLabel")
+					tl.Size = UDim2.fromScale(1, 1)
+					tl.BackgroundTransparency = 1
+					tl.Font = Enum.Font.GothamBold
+					tl.TextSize = 13
+					tl.TextStrokeTransparency = 0.4
+					tl.Parent = bb
+
+					o = { hl = hl, bb = bb, tl = tl, char = ch }
+					espObjs[plr] = o
+				end
+				o.hl.FillColor = COLORS[role]
+				o.hl.OutlineColor = COLORS[role]
+				o.tl.TextColor3 = COLORS[role]
+				o.bb.Enabled = S.ESPNames
+				o.tl.Text = plr.DisplayName .. " [" .. role .. "]"
+			else
+				clearESP(plr)
+			end
+		end
+	end
+end
+
+Players.PlayerRemoving:Connect(clearESP)
+
+task.spawn(function()
+	while running do
+		pcall(updateESP)
+		task.wait(0.4)
+	end
+end)
+
+-- ========== AUTO GRAB GUN ==========
+task.spawn(function()
+	while running do
+		if S.Gun then
+			pcall(function()
+				local gun = workspace:FindFirstChild("GunDrop", true)
+				local hrp = getHRP()
+				if gun and hrp and getRole(lp) == "Innocent" then
+					local back = hrp.CFrame
+					hrp.CFrame = gun.CFrame
+					if firetouchinterest then
+						firetouchinterest(hrp, gun, 0)
+						firetouchinterest(hrp, gun, 1)
+					end
+					task.wait(0.3)
+					hrp.CFrame = back
+				end
+			end)
+		end
+		task.wait(0.5)
+	end
+end)
+
+-- ========== COIN COLLECTOR ==========
+local visited = {}
+
+local function nearestCoin(hrp)
+	local container = workspace:FindFirstChild("CoinContainer", true)
+	if not container then
+		return nil
+	end
+	local best, bestDist
+	for _, c in ipairs(container:GetDescendants()) do
+		if c:IsA("BasePart") and c.Name == "Coin_Server" then
+			local t = visited[c]
+			if not t or os.clock() - t > 6 then
+				local d = (c.Position - hrp.Position).Magnitude
+				if not bestDist or d < bestDist then
+					best, bestDist = c, d
+				end
+			end
+		end
+	end
+	return best, bestDist
+end
+
+task.spawn(function()
+	while running do
+		if S.Coins then
+			pcall(function()
+				local hrp = getHRP()
+				local hum = getHum()
+				if hrp and hum and hum.Health > 0 then
+					local coin, dist = nearestCoin(hrp)
+					if coin then
+						visited[coin] = os.clock()
+						local tw = TweenService:Create(
+							hrp,
+							TweenInfo.new(math.max(dist / S.CoinSpeed, 0.05), Enum.EasingStyle.Linear),
+							{ CFrame = CFrame.new(coin.Position) }
+						)
+						tw:Play()
+						tw.Completed:Wait()
+						if firetouchinterest then
+							firetouchinterest(hrp, coin, 0)
+							firetouchinterest(hrp, coin, 1)
+						end
+						task.wait(0.1)
+					else
+						task.wait(0.5)
+					end
+				end
+			end)
+		end
+		task.wait(0.05)
+	end
+end)
+
+-- ========== MOVEMENT ==========
+RunService.Heartbeat:Connect(function()
+	if not running then
+		return
+	end
+	local hum = getHum()
+	if hum then
+		if S.Speed then
+			hum.WalkSpeed = S.SpeedVal
+		end
+		if S.Jump then
+			hum.UseJumpPower = true
+			hum.JumpPower = S.JumpVal
+		end
+	end
+end)
+
+RunService.Stepped:Connect(function()
+	if not running then
+		return
+	end
+	if S.Noclip or S.Coins then
+		local c = lp.Character
+		if c then
+			for _, p in ipairs(c:GetDescendants()) do
+				if p:IsA("BasePart") then
+					p.CanCollide = false
+				end
+			end
+		end
+	end
+end)
+
+-- ========== UI ==========
+local function new(class, props, parent)
+	local i = Instance.new(class)
+	for k, v in pairs(props) do
+		i[k] = v
+	end
+	i.Parent = parent
+	return i
+end
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "GrapeLu"
+gui.ResetOnSpawn = false
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+do
+	local ok = pcall(function()
+		gui.Parent = (gethui and gethui()) or game:GetService("CoreGui")
+	end)
+	if not ok or not gui.Parent then
+		gui.Parent = lp:WaitForChild("PlayerGui")
+	end
+end
+
+local BG = Color3.fromRGB(18, 18, 24)
+local PANEL = Color3.fromRGB(26, 26, 34)
+local ELEM = Color3.fromRGB(36, 36, 48)
+local ACCENT = Color3.fromRGB(120, 90, 255)
+local TEXT = Color3.fromRGB(235, 235, 245)
+local DIM = Color3.fromRGB(150, 150, 170)
+
+local main = new("Frame", {
+	Size = UDim2.fromOffset(400, 290),
+	Position = UDim2.new(0.5, -200, 0.5, -145),
+	BackgroundColor3 = BG,
+	BorderSizePixel = 0,
+}, gui)
+new("UICorner", { CornerRadius = UDim.new(0, 10) }, main)
+new("UIStroke", { Color = ACCENT, Thickness = 1, Transparency = 0.5 }, main)
+
+local title = new("Frame", {
+	Size = UDim2.new(1, 0, 0, 34),
+	BackgroundColor3 = PANEL,
+	BorderSizePixel = 0,
+}, main)
+new("UICorner", { CornerRadius = UDim.new(0, 10) }, title)
+new("TextLabel", {
+	Size = UDim2.new(1, -80, 1, 0),
+	Position = UDim2.fromOffset(12, 0),
+	BackgroundTransparency = 1,
+	Text = "🍇 GrapeLu",
+	Font = Enum.Font.GothamBold,
+	TextSize = 14,
+	TextColor3 = TEXT,
+	TextXAlignment = Enum.TextXAlignment.Left,
+}, title)
+
+local body = new("Frame", {
+	Size = UDim2.new(1, 0, 1, -34),
+	Position = UDim2.fromOffset(0, 34),
+	BackgroundTransparency = 1,
+}, main)
+
+-- Dragging
+do
+	local dragging, startPos, startInput
+	title.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging, startPos, startInput = true, main.Position, input.Position
+			input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then
+					dragging = false
+				end
+			end)
+		end
+	end)
+	UserInputService.InputChanged:Connect(function(input)
+		if
+			dragging
+			and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch)
+		then
+			local d = input.Position - startInput
+			main.Position = UDim2.new(
+				startPos.X.Scale,
+				startPos.X.Offset + d.X,
+				startPos.Y.Scale,
+				startPos.Y.Offset + d.Y
+			)
+		end
+	end)
+end
+
+-- Minimize button
+local mini = new("TextButton", {
+	Size = UDim2.fromOffset(28, 22),
+	Position = UDim2.new(1, -66, 0, 6),
+	BackgroundColor3 = ELEM,
+	Text = "–",
+	Font = Enum.Font.GothamBold,
+	TextSize = 14,
+	TextColor3 = TEXT,
+	AutoButtonColor = true,
+}, title)
+new("UICorner", { CornerRadius = UDim.new(0, 6) }, mini)
+local minimized = false
+mini.MouseButton1Click:Connect(function()
+	minimized = not minimized
+	body.Visible = not minimized
+	main.Size = minimized and UDim2.fromOffset(400, 34) or UDim2.fromOffset(400, 290)
+end)
+
+-- Unload button
+local close = new("TextButton", {
+	Size = UDim2.fromOffset(28, 22),
+	Position = UDim2.new(1, -34, 0, 6),
+	BackgroundColor3 = Color3.fromRGB(150, 45, 55),
+	Text = "X",
+	Font = Enum.Font.GothamBold,
+	TextSize = 12,
+	TextColor3 = TEXT,
+}, title)
+new("UICorner", { CornerRadius = UDim.new(0, 6) }, close)
+close.MouseButton1Click:Connect(function()
+	running = false
+	for _, plr in ipairs(Players:GetPlayers()) do
+		clearESP(plr)
+	end
+	local hum = getHum()
+	if hum then
+		hum.WalkSpeed = 16
+		hum.JumpPower = 50
+	end
+	gui:Destroy()
+end)
+
+-- Tabs
+local tabBar = new("Frame", {
+	Size = UDim2.new(0, 100, 1, -10),
+	Position = UDim2.fromOffset(6, 5),
+	BackgroundColor3 = PANEL,
+	BorderSizePixel = 0,
+}, body)
+new("UICorner", { CornerRadius = UDim.new(0, 8) }, tabBar)
+new("UIListLayout", { Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder }, tabBar)
+new("UIPadding", { PaddingTop = UDim.new(0, 6), PaddingLeft = UDim.new(0, 6), PaddingRight = UDim.new(0, 6) }, tabBar)
+
+local pageHolder = new("Frame", {
+	Size = UDim2.new(1, -118, 1, -10),
+	Position = UDim2.fromOffset(112, 5),
+	BackgroundTransparency = 1,
+}, body)
+
+local pages, tabButtons = {}, {}
+
+local function selectTab(name)
+	for n, p in pairs(pages) do
+		p.Visible = (n == name)
+	end
+	for n, b in pairs(tabButtons) do
+		b.BackgroundColor3 = (n == name) and ACCENT or ELEM
+	end
+end
+
+local function addTab(name, order)
+	local btn = new("TextButton", {
+		Size = UDim2.new(1, 0, 0, 28),
+		BackgroundColor3 = ELEM,
+		Text = name,
+		Font = Enum.Font.GothamMedium,
+		TextSize = 12,
+		TextColor3 = TEXT,
+		LayoutOrder = order,
+	}, tabBar)
+	new("UICorner", { CornerRadius = UDim.new(0, 6) }, btn)
+	local page = new("ScrollingFrame", {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		ScrollBarThickness = 3,
+		CanvasSize = UDim2.new(),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		Visible = false,
+	}, pageHolder)
+	new("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, page)
+	new("UIPadding", { PaddingRight = UDim.new(0, 6) }, page)
+	pages[name], tabButtons[name] = page, btn
+	btn.MouseButton1Click:Connect(function()
+		selectTab(name)
+	end)
+	return page
+end
+
+local function addToggle(page, text, key, onChange)
+	local row = new("Frame", {
+		Size = UDim2.new(1, 0, 0, 34),
+		BackgroundColor3 = ELEM,
+		BorderSizePixel = 0,
+	}, page)
+	new("UICorner", { CornerRadius = UDim.new(0, 6) }, row)
+	new("TextLabel", {
+		Size = UDim2.new(1, -70, 1, 0),
+		Position = UDim2.fromOffset(10, 0),
+		BackgroundTransparency = 1,
+		Text = text,
+		Font = Enum.Font.Gotham,
+		TextSize = 13,
+		TextColor3 = TEXT,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, row)
+	local btn = new("TextButton", {
+		Size = UDim2.fromOffset(52, 22),
+		Position = UDim2.new(1, -60, 0.5, -11),
+		BackgroundColor3 = Color3.fromRGB(60, 60, 75),
+		Text = "OFF",
+		Font = Enum.Font.GothamBold,
+		TextSize = 11,
+		TextColor3 = DIM,
+	}, row)
+	new("UICorner", { CornerRadius = UDim.new(0, 6) }, btn)
+	local function refresh()
+		btn.Text = S[key] and "ON" or "OFF"
+		btn.BackgroundColor3 = S[key] and ACCENT or Color3.fromRGB(60, 60, 75)
+		btn.TextColor3 = S[key] and TEXT or DIM
+	end
+	btn.MouseButton1Click:Connect(function()
+		S[key] = not S[key]
+		refresh()
+		if onChange then
+			onChange(S[key])
+		end
+	end)
+	refresh()
+end
+
+local function addValue(page, text, key, min, max)
+	local row = new("Frame", {
+		Size = UDim2.new(1, 0, 0, 34),
+		BackgroundColor3 = ELEM,
+		BorderSizePixel = 0,
+	}, page)
+	new("UICorner", { CornerRadius = UDim.new(0, 6) }, row)
+	new("TextLabel", {
+		Size = UDim2.new(1, -80, 1, 0),
+		Position = UDim2.fromOffset(10, 0),
+		BackgroundTransparency = 1,
+		Text = text,
+		Font = Enum.Font.Gotham,
+		TextSize = 13,
+		TextColor3 = TEXT,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, row)
+	local box = new("TextBox", {
+		Size = UDim2.fromOffset(52, 22),
+		Position = UDim2.new(1, -60, 0.5, -11),
+		BackgroundColor3 = Color3.fromRGB(50, 50, 65),
+		Text = tostring(S[key]),
+		Font = Enum.Font.GothamBold,
+		TextSize = 12,
+		TextColor3 = TEXT,
+		ClearTextOnFocus = false,
+	}, row)
+	new("UICorner", { CornerRadius = UDim.new(0, 6) }, box)
+	box.FocusLost:Connect(function()
+		local n = tonumber(box.Text)
+		if n then
+			S[key] = math.clamp(n, min, max)
+		end
+		box.Text = tostring(S[key])
+	end)
+end
+
+local function addLabel(page, text)
+	new("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 30),
+		BackgroundTransparency = 1,
+		Text = text,
+		Font = Enum.Font.Gotham,
+		TextSize = 11,
+		TextColor3 = DIM,
+		TextWrapped = true,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, page)
+end
+
+-- ESP tab
+local espPage = addTab("ESP", 1)
+addToggle(espPage, "Role ESP", "ESP", function(on)
+	if not on then
+		for _, plr in ipairs(Players:GetPlayers()) do
+			clearESP(plr)
+		end
+	end
+end)
+addToggle(espPage, "Show names", "ESPNames")
+addLabel(espPage, "Red = Murderer, Blue = Sheriff, Green = Innocent")
+
+-- Farm tab
+local farmPage = addTab("Farm", 2)
+addToggle(farmPage, "Coin collector", "Coins")
+addValue(farmPage, "Coin speed", "CoinSpeed", 10, 60)
+addToggle(farmPage, "Auto grab gun", "Gun")
+addLabel(farmPage, "Gun grab returns you to where you were. Only runs while you're Innocent.")
+
+-- Player tab
+local plrPage = addTab("Player", 3)
+addToggle(plrPage, "Speed", "Speed", function(on)
+	if not on then
+		local h = getHum()
+		if h then
+			h.WalkSpeed = 16
+		end
+	end
+end)
+addValue(plrPage, "Walk speed", "SpeedVal", 16, 80)
+addToggle(plrPage, "Jump power", "Jump", function(on)
+	if not on then
+		local h = getHum()
+		if h then
+			h.JumpPower = 50
+		end
+	end
+end)
+addValue(plrPage, "Jump value", "JumpVal", 50, 200)
+addToggle(plrPage, "Noclip", "Noclip")
+
+selectTab("ESP")
