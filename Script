@@ -1,6 +1,6 @@
 --[[
     GrapeLu - Murder Mystery 2
-    Features: Role ESP, Coin Collector, Auto Grab Gun, Speed / Jump / Noclip
+    Features: Role ESP, Coin Collector, Auto Grab Gun, Speed / Jump / Noclip, Aim Assist, Silent Aim
     UI: dark tabbed, draggable, works on mobile executors
     RightShift (PC) shows / hides the menu.
 ]]
@@ -38,6 +38,16 @@ local S = {
 	Jump = false,
 	JumpVal = 60,
 	Noclip = false,
+	-- Aim
+	Aim = false,
+	AimHold = true, -- PC: only aim while holding right mouse
+	AimSmooth = 30, -- percent per frame (100 = instant snap)
+	Silent = false,
+	AimFOV = 150,
+	AimHead = false,
+	AimWall = true, -- skip targets behind walls
+	Predict = 0, -- lead time in hundredths of a second (0 = off)
+	ShowFOV = true,
 }
 
 -- Values to restore when a toggle is switched off
@@ -343,6 +353,7 @@ end
 local gui = Instance.new("ScreenGui")
 gui.Name = "GrapeLu"
 gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
 gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 do
 	local ok = pcall(function()
@@ -640,6 +651,137 @@ local function addLabel(page, text)
 	}, page)
 end
 
+-- ========== AIM ASSIST / SILENT AIM ==========
+-- Role based: as Sheriff it targets the Murderer, as Murderer it targets everyone else.
+-- Only active while you are holding your Gun or Knife.
+local mouse = lp:GetMouse()
+local silentPos, silentPart
+
+local function holdingWeapon()
+	local c = lp.Character
+	return c ~= nil and (c:FindFirstChild("Gun") ~= nil or c:FindFirstChild("Knife") ~= nil)
+end
+
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local function isVisible(cam, part, targetChar)
+	local filter = { targetChar }
+	if lp.Character then
+		filter[2] = lp.Character
+	end
+	rayParams.FilterDescendantsInstances = filter
+	local origin = cam.CFrame.Position
+	return workspace:Raycast(origin, part.Position - origin, rayParams) == nil
+end
+
+local function aimCenter(cam)
+	if UserInputService.MouseEnabled then
+		return UserInputService:GetMouseLocation()
+	end
+	return cam.ViewportSize / 2
+end
+
+local function getAimTarget(cam)
+	local myRole = getRole(lp)
+	if myRole ~= "Sheriff" and myRole ~= "Murderer" then
+		return nil
+	end
+	local center = aimCenter(cam)
+	local bestPos, bestPart, bestDist = nil, nil, S.AimFOV
+	for _, plr in ipairs(Players:GetPlayers()) do
+		local ch = plr ~= lp and plr.Character
+		local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+		local part = ch and ch:FindFirstChild(S.AimHead and "Head" or "HumanoidRootPart")
+		if hum and part and hum.Health > 0 then
+			local role = getRole(plr)
+			if myRole == "Murderer" or role == "Murderer" then
+				local sp, onScreen = cam:WorldToViewportPoint(part.Position)
+				if onScreen then
+					local d = (Vector2.new(sp.X, sp.Y) - center).Magnitude
+					if d < bestDist and (not S.AimWall or isVisible(cam, part, ch)) then
+						bestDist = d
+						bestPart = part
+						bestPos = part.Position + part.AssemblyLinearVelocity * (S.Predict / 100)
+					end
+				end
+			end
+		end
+	end
+	return bestPos, bestPart
+end
+
+-- FOV circle
+local fovCircle = new("Frame", {
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+	Visible = false,
+	ZIndex = 0,
+}, gui)
+new("UICorner", { CornerRadius = UDim.new(1, 0) }, fovCircle)
+new("UIStroke", { Color = ACCENT, Thickness = 1.5, Transparency = 0.3 }, fovCircle)
+
+track(RunService.RenderStepped:Connect(function()
+	if not running then
+		return
+	end
+	local cam = workspace.CurrentCamera
+	if not cam then
+		return
+	end
+
+	local aimOn = S.Aim or S.Silent
+	local c = aimCenter(cam)
+	fovCircle.Visible = S.ShowFOV and aimOn
+	fovCircle.Size = UDim2.fromOffset(S.AimFOV * 2, S.AimFOV * 2)
+	fovCircle.Position = UDim2.fromOffset(c.X, c.Y)
+
+	silentPos, silentPart = nil, nil
+	if aimOn and holdingWeapon() then
+		local pos, part = getAimTarget(cam)
+		if pos then
+			if S.Silent then
+				silentPos, silentPart = pos, part
+			end
+			if S.Aim then
+				local holding = not S.AimHold or UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
+				if holding then
+					local goal = CFrame.lookAt(cam.CFrame.Position, pos)
+					cam.CFrame = cam.CFrame:Lerp(goal, math.clamp(S.AimSmooth / 100, 0.01, 1))
+				end
+			end
+		end
+	end
+end))
+
+-- Silent aim: makes the game read the target as your mouse position when it asks.
+-- Needs an executor with hookmetamethod; if missing, the toggle simply does nothing.
+local hasHook = false
+do
+	local ok = pcall(function()
+		if hookmetamethod and newcclosure and checkcaller then
+			local oldIndex
+			oldIndex = hookmetamethod(
+				game,
+				"__index",
+				newcclosure(function(self, key)
+					if running and S.Silent and silentPos and not checkcaller() and self == mouse then
+						if key == "Hit" then
+							return CFrame.new(silentPos)
+						elseif key == "Target" then
+							return silentPart
+						end
+					end
+					return oldIndex(self, key)
+				end)
+			)
+			hasHook = true
+		end
+	end)
+	hasHook = ok and hasHook
+end
+
 -- ESP tab
 local espPage = addTab("ESP", 1)
 addToggle(espPage, "Role ESP", "ESP", function(on)
@@ -688,5 +830,22 @@ addToggle(plrPage, "Jump power", "Jump", function(on)
 end)
 addValue(plrPage, "Jump value", "JumpVal", 50, 200)
 addToggle(plrPage, "Noclip", "Noclip")
+
+-- Aim tab
+local aimPage = addTab("Aim", 4)
+addToggle(aimPage, "Aim assist", "Aim")
+addToggle(aimPage, "Hold RMB to aim", "AimHold")
+addValue(aimPage, "Smoothness %", "AimSmooth", 1, 100)
+addToggle(aimPage, "Silent aim", "Silent", function(on)
+	if on and not hasHook then
+		warn("[GrapeLu] Silent aim needs hookmetamethod, which your executor doesn't support.")
+	end
+end)
+addValue(aimPage, "FOV radius", "AimFOV", 30, 500)
+addToggle(aimPage, "Show FOV circle", "ShowFOV")
+addToggle(aimPage, "Target head", "AimHead")
+addToggle(aimPage, "Wall check", "AimWall")
+addValue(aimPage, "Prediction", "Predict", 0, 30)
+addLabel(aimPage, "Sheriff aims at the Murderer, Murderer aims at everyone. Only active while holding your Gun/Knife. On mobile turn off Hold RMB.")
 
 selectTab("ESP")
