@@ -143,6 +143,8 @@ local S = {
 	SilentFOV = 180,
 	SilentStrict = true, -- silent aim only targets players inside its FOV circle
 	LogShots = false, -- debug: print remote calls to the console
+	Nice = false, -- soft bloom + pink tint over the whole game
+	NiceAmount = 60, -- 0-100
 	AutoLoad = false, -- load the saved config when the script starts
 }
 
@@ -152,6 +154,7 @@ for k, v in pairs(S) do
 	DEFAULTS[k] = v
 end
 local uiApply = {}
+local niceBloom, niceCC -- Nice mode effects (removed again on unload)
 
 -- Values to restore when a toggle is switched off
 local orig = { WalkSpeed = 16, JumpPower = 50 }
@@ -743,6 +746,14 @@ local function unload()
 			hum.JumpPower = orig.JumpPower
 		end
 	end
+	pcall(function()
+		if niceBloom then
+			niceBloom:Destroy()
+		end
+		if niceCC then
+			niceCC:Destroy()
+		end
+	end)
 	gui:Destroy()
 	if env.GrapeLuUnload == unload then
 		env.GrapeLuUnload = nil
@@ -1181,7 +1192,7 @@ local function addToggle(page, text, key, onChange)
 	end
 end
 
-local function addValue(page, text, key, min, max)
+local function addValue(page, text, key, min, max, onChange)
 	local row = new("Frame", {
 		Size = UDim2.new(1, 0, 0, 34),
 		BackgroundColor3 = ELEM,
@@ -1218,6 +1229,9 @@ local function addValue(page, text, key, min, max)
 		local n = tonumber(box.Text)
 		if n then
 			S[key] = math.clamp(n, min, max)
+			if onChange then
+				pcall(onChange, S[key])
+			end
 		end
 		box.Text = tostring(S[key])
 	end)
@@ -1226,6 +1240,9 @@ local function addValue(page, text, key, min, max)
 		if v then
 			S[key] = math.clamp(v, min, max)
 			box.Text = tostring(S[key])
+			if onChange then
+				pcall(onChange, S[key])
+			end
 		end
 	end
 end
@@ -1663,6 +1680,79 @@ addToggle(aimPage, "Wall check", "AimWall")
 addValue(aimPage, "Prediction", "Predict", 0, 30)
 addToggle(aimPage, "Log remotes (debug)", "LogShots")
 addLabel(aimPage, "Sheriff aims at the Murderer, Murderer aims at everyone. Only active while holding your Gun/Knife. Hold RMB is ignored on mobile. Silent aim ignores where you look. If it misses, turn on Log remotes, shoot once, and check the console.", 76)
+
+-- ========== NICE MODE ==========
+-- Soft bloom and a pink tint over the whole game, faded in and out smoothly.
+local Lighting = game:GetService("Lighting")
+local NICE_PINK = Color3.fromRGB(255, 180, 220)
+local niceToken = 0
+
+local function applyNice()
+	niceToken = niceToken + 1
+	local my = niceToken
+	local i = math.clamp(S.NiceAmount / 100, 0, 1)
+	if S.Nice then
+		if not (niceBloom and niceBloom.Parent and niceCC and niceCC.Parent) then
+			-- clear any leftovers from an earlier run
+			for _, n in ipairs({ "GrapeLuBloom", "GrapeLuTint" }) do
+				local old = Lighting:FindFirstChild(n)
+				if old then
+					old:Destroy()
+				end
+			end
+			niceBloom = Instance.new("BloomEffect")
+			niceBloom.Name = "GrapeLuBloom"
+			niceBloom.Intensity = 0
+			niceBloom.Size = 24
+			niceBloom.Threshold = 2
+			niceBloom.Parent = Lighting
+			niceCC = Instance.new("ColorCorrectionEffect")
+			niceCC.Name = "GrapeLuTint"
+			niceCC.Parent = Lighting
+		end
+		tween(niceBloom, {
+			Intensity = 0.4 + 1.2 * i,
+			Size = 24 + 40 * i,
+			Threshold = 1 - 0.35 * i,
+		}, 0.6)
+		tween(niceCC, {
+			TintColor = Color3.new(1, 1, 1):Lerp(NICE_PINK, 0.25 + 0.75 * i),
+			Saturation = 0.08 + 0.25 * i,
+			Contrast = 0.03 + 0.07 * i,
+			Brightness = 0.01 + 0.04 * i,
+		}, 0.6)
+	elseif niceBloom and niceCC then
+		tween(niceBloom, { Intensity = 0, Threshold = 2 }, 0.5)
+		tween(niceCC, {
+			TintColor = Color3.new(1, 1, 1),
+			Saturation = 0,
+			Contrast = 0,
+			Brightness = 0,
+		}, 0.5)
+		task.delay(0.55, function()
+			if niceToken == my then
+				if niceBloom then
+					niceBloom:Destroy()
+					niceBloom = nil
+				end
+				if niceCC then
+					niceCC:Destroy()
+					niceCC = nil
+				end
+			end
+		end)
+	end
+end
+
+-- Misc tab
+local miscPage = addTab("Misc", 6)
+addToggle(miscPage, "Nice mode", "Nice", function()
+	applyNice()
+end)
+addValue(miscPage, "Nice amount %", "NiceAmount", 0, 100, function()
+	applyNice()
+end)
+addLabel(miscPage, "Nice mode adds soft bloom and a pink tint to the whole game. A higher amount is glowier and pinker.", 52)
 
 -- Config tab
 local configPage = addTab("Config", 5)
