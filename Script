@@ -48,7 +48,8 @@ local S = {
 	AimWall = true, -- skip targets behind walls
 	Predict = 3, -- lead time in hundredths of a second (0 = off)
 	ShowFOV = true,
-	SilentFOV = 500, -- silent aim looks much wider than aim assist
+	SilentFOV = 180,
+	SilentStrict = true, -- silent aim only targets players inside its FOV circle
 	LogShots = false, -- debug: print remote calls to the console
 }
 
@@ -254,6 +255,7 @@ end)
 
 -- ========== AUTO GRAB GUN ==========
 local gunBusy = false
+local killBusy = false
 local lastDeepSearch = 0
 
 local function findGun()
@@ -341,7 +343,7 @@ task.spawn(function()
 		if not S.Coins then
 			coinActive = false
 		end
-		if S.Coins and not gunBusy then
+		if S.Coins and not gunBusy and not killBusy then
 			pcall(function()
 				if not inMatch() then
 					coinActive = false
@@ -369,6 +371,7 @@ task.spawn(function()
 							running
 							and S.Coins
 							and not gunBusy
+							and not killBusy
 							and roundOn()
 							and coin.Parent
 							and hrp.Parent
@@ -429,7 +432,7 @@ track(RunService.Stepped:Connect(function()
 	if not running then
 		return
 	end
-	if S.Noclip or coinActive then
+	if S.Noclip or coinActive or killBusy then
 		ncActive = true
 		local c = lp.Character
 		if c then
@@ -448,11 +451,144 @@ track(RunService.Stepped:Connect(function()
 	end
 end))
 
+-- ========== KILL ALL (Murderer only) ==========
+local killActive = false
+
+local function notify(text)
+	pcall(function()
+		game:GetService("StarterGui"):SetCore("SendNotification", { Title = "GrapeLu", Text = text, Duration = 4 })
+	end)
+end
+
+local function isAlive(plr)
+	local ch = plr.Character
+	local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+	return ch ~= nil and hum ~= nil and hum.Health > 0 and ch:FindFirstChild("HumanoidRootPart") ~= nil
+end
+
+local function findKnife()
+	local c = lp.Character
+	local bp = lp:FindFirstChild("Backpack")
+	return (c and c:FindFirstChild("Knife")) or (bp and bp:FindFirstChild("Knife"))
+end
+
+local function findRemote(tool, part)
+	for _, d in ipairs(tool:GetDescendants()) do
+		if d:IsA("RemoteEvent") and string.find(string.lower(d.Name), part, 1, true) then
+			return d
+		end
+	end
+end
+
+-- Goes after one player for up to ~1.5s. Returns true if they ended up dead.
+local function killOne(plr, knife, stab, throw)
+	local t0, lastThrow = os.clock(), 0
+	while running and killActive and os.clock() - t0 < 1.5 do
+		local hrp, hum = getHRP(), getHum()
+		local ch = plr.Character
+		local thrp = ch and ch:FindFirstChild("HumanoidRootPart")
+		local thum = ch and ch:FindFirstChildOfClass("Humanoid")
+		if not (hrp and hum and thrp and thum) or hum.Health <= 0 or thum.Health <= 0 then
+			break
+		end
+		-- stand right behind them, facing them
+		hrp.CFrame = CFrame.lookAt((thrp.CFrame * CFrame.new(0, 0, 2.5)).Position, thrp.Position)
+		if knife.Parent ~= lp.Character then
+			hum:EquipTool(knife)
+		end
+		if stab then
+			stab:FireServer("Slash")
+		end
+		local handle = knife:FindFirstChild("Handle")
+		if firetouchinterest and handle then
+			firetouchinterest(handle, thrp, 0)
+			firetouchinterest(handle, thrp, 1)
+		end
+		if not stab and throw and os.clock() - lastThrow > 0.35 then
+			lastThrow = os.clock()
+			throw:FireServer(CFrame.new(hrp.Position, thrp.Position), thrp.Position)
+		end
+		task.wait(0.05)
+	end
+	local ch = plr.Character
+	local thum = ch and ch:FindFirstChildOfClass("Humanoid")
+	return thum == nil or thum.Health <= 0
+end
+
+local function killAll(btn)
+	if killActive then
+		killActive = false -- pressing again stops it
+		return
+	end
+	if not inMatch() or getRole(lp) ~= "Murderer" then
+		notify("Kill all needs you to be the Murderer in a round.")
+		return
+	end
+	local knife = findKnife()
+	if not knife then
+		notify("Couldn't find your knife.")
+		return
+	end
+	killActive, killBusy = true, true
+	if btn then
+		btn.Text = "Stop kill all"
+	end
+	task.spawn(function()
+		local kills, attempted, tries = 0, 0, {}
+		pcall(function()
+			local stab, throw = findRemote(knife, "stab"), findRemote(knife, "throw")
+			if S.LogShots then
+				print("[GrapeLu] kill all remotes:", stab, throw)
+			end
+			local hum = getHum()
+			if hum then
+				hum:EquipTool(knife)
+			end
+			task.wait(0.15)
+			while running and killActive do
+				local hrp = getHRP()
+				if not hrp then
+					break
+				end
+				-- always go for the closest living player next
+				local target, best
+				for _, plr in ipairs(Players:GetPlayers()) do
+					if plr ~= lp and isAlive(plr) and (tries[plr] or 0) < 2 then
+						local d = (plr.Character.HumanoidRootPart.Position - hrp.Position).Magnitude
+						if not best or d < best then
+							target, best = plr, d
+						end
+					end
+				end
+				if not target then
+					break
+				end
+				tries[target] = (tries[target] or 0) + 1
+				attempted = attempted + 1
+				if killOne(target, knife, stab, throw) then
+					kills = kills + 1
+				end
+			end
+		end)
+		killActive, killBusy = false, false
+		if btn and btn.Parent then
+			btn.Text = "Kill all (Murderer)"
+		end
+		if kills > 0 then
+			notify("Kill all finished: " .. kills .. " down.")
+		elseif attempted > 0 then
+			notify("Kill all didn't land any kills. Turn on Log remotes (Aim tab) and tell me what prints.")
+		end
+	end)
+end
+
 -- Reset per-life state so nothing carries over after a respawn / new round
 track(lp.CharacterAdded:Connect(function()
 	cancelTween()
 	gunBusy = false
 	coinActive = false
+	killActive = false
+	killBusy = false
 	table.clear(ncOrig)
 	table.clear(visited)
 end))
@@ -870,6 +1006,24 @@ local function addLabel(page, text, height)
 	}, page)
 end
 
+local function addButton(page, text, onClick)
+	local btn = new("TextButton", {
+		Size = UDim2.new(1, 0, 0, 34),
+		BackgroundColor3 = ACCENT,
+		Text = text,
+		Font = Enum.Font.GothamBold,
+		TextSize = 13,
+		TextColor3 = TEXT,
+		AutoButtonColor = false,
+	}, page)
+	new("UICorner", { CornerRadius = UDim.new(0, 6) }, btn)
+	hoverFx(btn, ACCENT, Color3.fromRGB(145, 120, 255))
+	btn.MouseButton1Click:Connect(function()
+		onClick(btn)
+	end)
+	return btn
+end
+
 -- ========== AIM ASSIST / SILENT AIM ==========
 -- Role based: as Sheriff it targets the Murderer, as Murderer it targets everyone else.
 -- Only active while you are holding your Gun or Knife.
@@ -967,6 +1121,17 @@ local fovCircle = new("Frame", {
 new("UICorner", { CornerRadius = UDim.new(1, 0) }, fovCircle)
 new("UIStroke", { Color = ACCENT, Thickness = 1.5, Transparency = 0.3 }, fovCircle)
 
+-- Separate circle for silent aim (pink), so both can show at once
+local silentCircle = new("Frame", {
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+	Visible = false,
+	ZIndex = 0,
+}, gui)
+new("UICorner", { CornerRadius = UDim.new(1, 0) }, silentCircle)
+new("UIStroke", { Color = Color3.fromRGB(255, 110, 190), Thickness = 1.5, Transparency = 0.2 }, silentCircle)
+
 pcall(function()
 	RunService:UnbindFromRenderStep("GrapeLuAim")
 end)
@@ -981,10 +1146,12 @@ RunService:BindToRenderStep("GrapeLuAim", Enum.RenderPriority.Camera.Value + 1, 
 
 	local aimOn = S.Aim or S.Silent
 	local c = aimCenter(cam)
-	local radius = S.Aim and S.AimFOV or S.SilentFOV
-	fovCircle.Visible = S.ShowFOV and aimOn
-	fovCircle.Size = UDim2.fromOffset(radius * 2, radius * 2)
+	fovCircle.Visible = S.ShowFOV and S.Aim
+	fovCircle.Size = UDim2.fromOffset(S.AimFOV * 2, S.AimFOV * 2)
 	fovCircle.Position = UDim2.fromOffset(c.X, c.Y)
+	silentCircle.Visible = S.ShowFOV and S.Silent
+	silentCircle.Size = UDim2.fromOffset(S.SilentFOV * 2, S.SilentFOV * 2)
+	silentCircle.Position = UDim2.fromOffset(c.X, c.Y)
 
 	silentPos, silentPart = nil, nil
 	if aimOn and holdingWeapon() then
@@ -1001,7 +1168,7 @@ RunService:BindToRenderStep("GrapeLuAim", Enum.RenderPriority.Camera.Value + 1, 
 			end
 		end
 		if S.Silent then
-			silentPos, silentPart = getAimTarget(cam, S.SilentFOV, true)
+			silentPos, silentPart = getAimTarget(cam, S.SilentFOV, not S.SilentStrict)
 		end
 	end
 end)
@@ -1056,7 +1223,7 @@ local function shotTarget()
 	-- the render loop had nothing cached, so look again right now
 	local cam = workspace.CurrentCamera
 	if cam then
-		return (getAimTarget(cam, S.SilentFOV, true))
+		return (getAimTarget(cam, S.SilentFOV, not S.SilentStrict))
 	end
 end
 
@@ -1157,7 +1324,8 @@ addToggle(farmPage, "Coin collector", "Coins", function(on)
 end)
 addValue(farmPage, "Coin speed", "CoinSpeed", 10, 60)
 addToggle(farmPage, "Auto grab gun", "Gun")
-addLabel(farmPage, "Both only run while you're alive in a round. Gun grab returns you to where you were and only runs while you're Innocent.", 52)
+addButton(farmPage, "Kill all (Murderer)", killAll)
+addLabel(farmPage, "Coin collector and gun grab only run while you're alive in a round. Gun grab only runs while you're Innocent. Kill all is Murderer only, tap it again to stop.", 64)
 
 -- Player tab
 local plrPage = addTab("Player", 3)
@@ -1206,6 +1374,7 @@ addToggle(aimPage, "Silent aim", "Silent", function(on)
 end)
 addValue(aimPage, "Aim FOV radius", "AimFOV", 30, 500)
 addValue(aimPage, "Silent FOV radius", "SilentFOV", 30, 2000)
+addToggle(aimPage, "Silent: only inside FOV", "SilentStrict")
 addToggle(aimPage, "Show FOV circle", "ShowFOV")
 addToggle(aimPage, "Target head", "AimHead")
 addToggle(aimPage, "Wall check", "AimWall")
