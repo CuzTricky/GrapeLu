@@ -741,6 +741,25 @@ do
 	end))
 end
 
+-- Grape icon: shown while the menu is closed. Drag it anywhere, tap it to reopen.
+local icon = new("TextButton", {
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	Size = UDim2.fromOffset(52, 52),
+	Position = UDim2.new(0, 46, 0.5, 0),
+	BackgroundColor3 = BG,
+	Text = "🍇",
+	TextSize = 28,
+	Font = Enum.Font.GothamBold,
+	TextColor3 = TEXT,
+	AutoButtonColor = false,
+	Visible = false,
+	ZIndex = 5,
+}, gui)
+new("UICorner", { CornerRadius = UDim.new(1, 0) }, icon)
+new("UIStroke", { Color = ACCENT, Thickness = 2, Transparency = 0.15 }, icon)
+local iconScale = new("UIScale", { Scale = 1 }, icon)
+hoverFx(icon, BG, Color3.fromRGB(34, 30, 52))
+
 -- Smooth show / hide
 local menuOpen = true
 local menuToken = 0
@@ -749,6 +768,7 @@ local function setMenuVisible(v)
 	menuToken = menuToken + 1
 	local my = menuToken
 	if v then
+		icon.Visible = false
 		main.Visible = true
 		scale.Scale = 0.9
 		tween(scale, { Scale = 1 }, 0.25, Enum.EasingStyle.Back)
@@ -757,9 +777,58 @@ local function setMenuVisible(v)
 		task.delay(0.16, function()
 			if menuToken == my then
 				main.Visible = false
+				icon.Visible = true
+				iconScale.Scale = 0.5
+				tween(iconScale, { Scale = 1 }, 0.25, Enum.EasingStyle.Back)
 			end
 		end)
 	end
+end
+
+-- Icon dragging (a tap without movement reopens the menu)
+do
+	local dragging, moved, startPos, startInput
+	icon.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging, moved = true, false
+			startPos, startInput = icon.Position, input.Position
+			input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then
+					dragging = false
+					if not moved then
+						setMenuVisible(true)
+					else
+						-- keep the icon on screen
+						local vp = gui.AbsoluteSize
+						local ap = icon.AbsolutePosition
+						local half = icon.AbsoluteSize.X / 2
+						local cx = math.clamp(ap.X + half, half, vp.X - half)
+						local cy = math.clamp(ap.Y + half, half, vp.Y - half)
+						tween(icon, { Position = UDim2.fromOffset(cx, cy) }, 0.15)
+					end
+				end
+			end)
+		end
+	end)
+	track(UserInputService.InputChanged:Connect(function(input)
+		if
+			dragging
+			and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch)
+		then
+			local d = input.Position - startInput
+			if d.Magnitude > 6 then
+				moved = true
+			end
+			if moved then
+				icon.Position = UDim2.new(
+					startPos.X.Scale,
+					startPos.X.Offset + d.X,
+					startPos.Y.Scale,
+					startPos.Y.Offset + d.Y
+				)
+			end
+		end
+	end))
 end
 
 -- RightShift shows / hides the menu (PC)
@@ -812,8 +881,7 @@ new("UICorner", { CornerRadius = UDim.new(0, 6) }, close)
 close.AutoButtonColor = false
 hoverFx(close, Color3.fromRGB(150, 45, 55), Color3.fromRGB(200, 60, 72))
 close.MouseButton1Click:Connect(function()
-	tween(scale, { Scale = 0.85 }, 0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
-	task.delay(0.12, unload)
+	setMenuVisible(false)
 end)
 
 -- Tabs
@@ -1006,10 +1074,11 @@ local function addLabel(page, text, height)
 	}, page)
 end
 
-local function addButton(page, text, onClick)
+local function addButton(page, text, onClick, color)
+	color = color or ACCENT
 	local btn = new("TextButton", {
 		Size = UDim2.new(1, 0, 0, 34),
-		BackgroundColor3 = ACCENT,
+		BackgroundColor3 = color,
 		Text = text,
 		Font = Enum.Font.GothamBold,
 		TextSize = 13,
@@ -1017,7 +1086,7 @@ local function addButton(page, text, onClick)
 		AutoButtonColor = false,
 	}, page)
 	new("UICorner", { CornerRadius = UDim.new(0, 6) }, btn)
-	hoverFx(btn, ACCENT, Color3.fromRGB(145, 120, 255))
+	hoverFx(btn, color, color:Lerp(Color3.new(1, 1, 1), 0.15))
 	btn.MouseButton1Click:Connect(function()
 		onClick(btn)
 	end)
@@ -1381,6 +1450,14 @@ addToggle(aimPage, "Wall check", "AimWall")
 addValue(aimPage, "Prediction", "Predict", 0, 30)
 addToggle(aimPage, "Log remotes (debug)", "LogShots")
 addLabel(aimPage, "Sheriff aims at the Murderer, Murderer aims at everyone. Only active while holding your Gun/Knife. Hold RMB is ignored on mobile. Silent aim ignores where you look. If it misses, turn on Log remotes, shoot once, and check the console.", 76)
+
+-- Misc tab
+local miscPage = addTab("Misc", 5)
+addLabel(miscPage, "X hides the menu into the grape icon. Tap the icon (or press RightShift) to open it again.", 40)
+addButton(miscPage, "Unload GrapeLu", function()
+	unload()
+end, Color3.fromRGB(150, 45, 55))
+addLabel(miscPage, "Unload fully removes the script and restores your speed, jump and collisions.", 40)
 
 selectTab("ESP")
 setMenuVisible(true)
