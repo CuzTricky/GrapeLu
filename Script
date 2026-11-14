@@ -46,7 +46,7 @@ local S = {
 	AimFOV = 150,
 	AimHead = false,
 	AimWall = true, -- skip targets behind walls
-	Predict = 0, -- lead time in hundredths of a second (0 = off)
+	Predict = 3, -- lead time in hundredths of a second (0 = off)
 	ShowFOV = true,
 	SilentFOV = 500, -- silent aim looks much wider than aim assist
 	LogShots = false, -- debug: print remote calls to the console
@@ -919,7 +919,7 @@ local function aimCenter(cam)
 	return cam.ViewportSize / 2
 end
 
-local function getAimTarget(cam, fov, allowOffscreen)
+local function getAimTarget(cam, fov, allowFallback)
 	local myRole = getRole(lp)
 	if myRole ~= "Sheriff" and myRole ~= "Murderer" then
 		return nil
@@ -932,15 +932,17 @@ local function getAimTarget(cam, fov, allowOffscreen)
 		local hum = ch and ch:FindFirstChildOfClass("Humanoid")
 		local part = ch and ch:FindFirstChild(S.AimHead and "Head" or "HumanoidRootPart")
 		if hum and part and hum.Health > 0 and (myRole == "Murderer" or getRole(plr) == "Murderer") then
-			local pos = part.Position + part.AssemblyLinearVelocity * (S.Predict / 100)
+			-- lead the target using horizontal speed only (jumping/falling would throw it off)
+			local vel = part.AssemblyLinearVelocity
+			local pos = part.Position + Vector3.new(vel.X, 0, vel.Z) * (S.Predict / 100)
 			local sp, onScreen = cam:WorldToViewportPoint(part.Position)
-			if onScreen then
-				local d = (Vector2.new(sp.X, sp.Y) - center).Magnitude
-				if d < bestDist and (not S.AimWall or isVisible(cam, part, ch)) then
+			local d = (Vector2.new(sp.X, sp.Y) - center).Magnitude
+			if onScreen and d < bestDist then
+				if not S.AimWall or isVisible(cam, part, ch) then
 					bestDist, bestPos, bestPart = d, pos, part
 				end
-			elseif allowOffscreen then
-				-- silent aim can still hit someone you aren't looking at
+			elseif allowFallback then
+				-- outside the circle / off-screen: silent aim still takes the closest one
 				local wd = (part.Position - cam.CFrame.Position).Magnitude
 				if (not farDist or wd < farDist) and (not S.AimWall or isVisible(cam, part, ch)) then
 					farDist, farPos, farPart = wd, pos, part
@@ -1004,83 +1006,137 @@ RunService:BindToRenderStep("GrapeLuAim", Enum.RenderPriority.Camera.Value + 1, 
 	end
 end)
 
--- Silent aim has two parts so it works however the game reads your aim:
---  1) Mouse.Hit / Mouse.Target are redirected to the target
---  2) gun / knife remotes get their aim arguments rewritten to the target
--- Needs an executor with hookmetamethod; if missing, the toggle snaps back to OFF.
+-- Silent aim, based on how MM2 really sends shots:
+--   Sheriff: remote "ShootGun" (InvokeServer), aim position is argument 2
+--   Murderer: remote "Throw" (FireServer), aim position is argument 2
+-- So we rewrite the aim position of those remotes. Mouse.Hit / Mouse.Target are
+-- redirected as a backup. Works with hookmetamethod, or the raw metatable if your
+-- executor doesn't have it.
 local hasHook = false
 local remoteLogT = {}
-do
-	local ok = pcall(function()
-		if not (hookmetamethod and newcclosure and checkcaller) then
-			return
-		end
-		local oldIndex
-		oldIndex = hookmetamethod(
-			game,
-			"__index",
-			newcclosure(function(self, key)
-				if running and S.Silent and silentPos and self == mouse and not checkcaller() then
-					if key == "Hit" then
-						return CFrame.new(silentPos)
-					elseif key == "Target" then
-						return silentPart
-					end
-				end
-				return oldIndex(self, key)
-			end)
-		)
-		hasHook = true
+local safeCheck = checkcaller or function()
+	return false
+end
+local wrapC = newcclosure or function(f)
+	return f
+end
 
-		if getnamecallmethod then
-			local oldNamecall
-			oldNamecall = hookmetamethod(
-				game,
-				"__namecall",
-				newcclosure(function(self, ...)
-					local method = getnamecallmethod()
-					if running and (method == "FireServer" or method == "InvokeServer") and not checkcaller() then
-						local cls = self.ClassName
-						if cls == "RemoteEvent" or cls == "RemoteFunction" then
-							local name = self.Name
-							local lname = string.lower(name)
-							if S.LogShots then
-								local t = os.clock()
-								if not remoteLogT[name] or t - remoteLogT[name] > 0.5 then
-									remoteLogT[name] = t
-									print("[GrapeLu] remote:", name, method, ...)
+local function installHook(metaName, handler)
+	if hookmetamethod then
+		local old
+		old = hookmetamethod(game, metaName, wrapC(function(...)
+			return handler(old, ...)
+		end))
+		return true
+	end
+	if getrawmetatable then
+		local mt = getrawmetatable(game)
+		local old = mt[metaName]
+		local wasRO = isreadonly and isreadonly(mt)
+		if setreadonly then
+			setreadonly(mt, false)
+		elseif make_writeable then
+			make_writeable(mt)
+		end
+		mt[metaName] = wrapC(function(...)
+			return handler(old, ...)
+		end)
+		if setreadonly and wasRO ~= false then
+			setreadonly(mt, true)
+		end
+		return true
+	end
+	return false
+end
+
+local function shotTarget()
+	if silentPos then
+		return silentPos
+	end
+	-- the render loop had nothing cached, so look again right now
+	local cam = workspace.CurrentCamera
+	if cam then
+		return (getAimTarget(cam, S.SilentFOV, true))
+	end
+end
+
+pcall(function()
+	-- Main one: rewrite the aim position of the shoot / throw remotes
+	if getnamecallmethod then
+		local ok = installHook("__namecall", function(old, self, ...)
+			local method = getnamecallmethod()
+			if running and S.Silent and (method == "FireServer" or method == "InvokeServer") and not safeCheck() then
+				local cls = self.ClassName
+				if cls == "RemoteEvent" or cls == "RemoteFunction" then
+					local name = self.Name
+					local lname = string.lower(name)
+					if S.LogShots then
+						local t = os.clock()
+						if not remoteLogT[name] or t - remoteLogT[name] > 0.5 then
+							remoteLogT[name] = t
+							print("[GrapeLu] remote:", name, method, ...)
+						end
+					end
+					local isShot = lname == "shootgun"
+						or lname == "throw"
+						or string.find(lname, "shoot", 1, true)
+						or string.find(lname, "throw", 1, true)
+					if isShot then
+						local target = shotTarget()
+						if target then
+							local args = table.pack(...)
+							local changed = 0
+							for i = 1, args.n do
+								if typeof(args[i]) == "Vector3" then
+									args[i] = target
+									changed = changed + 1
 								end
 							end
-							local isShot = string.find(lname, "shoot", 1, true)
-								or string.find(lname, "throw", 1, true)
-								or string.find(lname, "knife", 1, true)
-								or string.find(lname, "gun", 1, true)
-							if S.Silent and silentPos and isShot then
-								local args = table.pack(...)
+							if changed == 0 then
+								-- no Vector3 aim argument: rewrite a CFrame that points far from you
 								local hrp = getHRP()
 								for i = 1, args.n do
 									local a = args[i]
-									if typeof(a) == "Vector3" then
-										args[i] = silentPos
-									elseif typeof(a) == "CFrame" and hrp and (a.Position - hrp.Position).Magnitude > 6 then
-										-- aimed point, not the throw origin
-										args[i] = CFrame.new(silentPos)
+									if typeof(a) == "CFrame" and hrp and (a.Position - hrp.Position).Magnitude > 6 then
+										args[i] = CFrame.new(target)
+										changed = changed + 1
 									end
+								end
+							end
+							if changed > 0 then
+								if S.LogShots then
+									print("[GrapeLu] silent aim redirected", name)
 								end
 								if setnamecallmethod then
 									setnamecallmethod(method)
 								end
-								return oldNamecall(self, table.unpack(args, 1, args.n))
+								return old(self, table.unpack(args, 1, args.n))
 							end
 						end
 					end
-					return oldNamecall(self, ...)
-				end)
-			)
+				end
+			end
+			return old(self, ...)
+		end)
+		if ok then
+			hasHook = true
 		end
+	end
+end)
+
+pcall(function()
+	-- Backup: Mouse.Hit / Mouse.Target
+	installHook("__index", function(old, self, key)
+		if running and S.Silent and silentPos and self == mouse and not safeCheck() then
+			if key == "Hit" then
+				return CFrame.new(silentPos)
+			elseif key == "Target" then
+				return silentPart
+			end
+		end
+		return old(self, key)
 	end)
-	hasHook = ok and hasHook
-end
+end)
 
 -- ESP tab
 local espPage = addTab("ESP", 1)
